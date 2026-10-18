@@ -1,0 +1,96 @@
+# Ad hoc release of the Eyes iPhone app (ayaangazali/eyes, apps/mobile): registers newly
+# registered worker iPhones with Apple, builds a signed ad hoc .ipa, uploads it with its
+# manifest to the `apps` bucket, and texts the workers. See ayaangazali/eyes docs/DEPLOY.md.
+name: adhoc-release
+
+on:
+  repository_dispatch:
+    types: [device-registered] # sent by the Eyes API when an iPhone registers on /install
+  schedule:
+    - cron: "7 * * * *" # hourly backstop; exits in seconds when nothing is pending
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and check only (no Apple registration, upload or texts)
+        type: boolean
+        default: true
+      ref:
+        description: ayaangazali/eyes ref to build
+        default: jerry/live-setup
+
+concurrency:
+  group: adhoc-release
+  cancel-in-progress: false
+
+env:
+  INSFORGE_BASE_URL: ${{ secrets.INSFORGE_BASE_URL }}
+  INSFORGE_API_KEY: ${{ secrets.INSFORGE_API_KEY }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      pending: ${{ steps.pending.outputs.count }}
+    steps:
+      - id: pending
+        run: |
+          n=$(curl -sf "$INSFORGE_BASE_URL/api/database/records/worker_devices?released_at=is.null&select=udid" \
+            -H "Authorization: Bearer $INSFORGE_API_KEY" | jq length)
+          echo "devices waiting: $n"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: check
+    if: github.event_name == 'workflow_dispatch' || needs.check.outputs.pending != '0'
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      INKBOX_API_KEY: ${{ secrets.INKBOX_API_KEY }}
+      INKBOX_AGENT_HANDLE: ${{ secrets.INKBOX_AGENT_HANDLE }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ayaangazali/eyes
+          ref: ${{ inputs.ref || 'jerry/live-setup' }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          xcodebuild -version
+      - name: Signing (temporary keychain, App Store Connect key)
+        env:
+          CERT_DEV_P12: ${{ secrets.CERT_DEV_P12 }}
+          CERT_DIST_P12: ${{ secrets.CERT_DIST_P12 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          kc="$RUNNER_TEMP/eyes.keychain-db"
+          kp=$(openssl rand -hex 16)
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          for c in "$CERT_DEV_P12" "$CERT_DIST_P12"; do
+            printf %s "$c" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          done
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kp" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf %s "$ASC_KEY_P8" > ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+          security find-identity -v -p codesigning | grep -c "2BPG8N4Z33"
+      - name: Release
+        run: node scripts/adhoc-release.ts ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '--dry-run' || '' }}
+      - name: Clean up signing
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/eyes.keychain-db" || true
+          rm -rf ~/.appstoreconnect
