@@ -1,13 +1,13 @@
 # Ad hoc release of the Eyes iOS app (ayaangazali/eyes, apps/mobile) without the operator's Mac:
 # `pnpm adhoc:release` registers new worker iPhones with Apple, builds, uploads Eyes.ipa and texts the workers.
-# Runs when the Eyes API sees a new iPhone (repository_dispatch), hourly as a backstop, or by hand.
+# Runs every 5 minutes (a Linux check starts the macOS build only when an iPhone waits), on a dispatch, or by hand.
 name: Ad hoc release
 
 on:
   repository_dispatch:
     types: [device-registered]
   schedule:
-    - cron: "17 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -94,8 +94,8 @@ jobs:
           security find-identity -v -p codesigning "$kc" | tail -1
 
       - name: pnpm adhoc:release
-        # Dry run by hand (input) or from a dispatch whose payload sets dry_run (tests of the dispatch path).
-        run: pnpm adhoc:release ${{ (inputs.dry_run || github.event.client_payload.dry_run) && '--dry-run' || '' }}
+        # Dry run by hand (input), from a dispatch payload, or for every run while the repo variable DRY_RUN is "true" (end-to-end tests).
+        run: pnpm adhoc:release ${{ (inputs.dry_run || github.event.client_payload.dry_run || vars.DRY_RUN == 'true') && '--dry-run' || '' }}
 
       - name: Clean up
         if: always()
