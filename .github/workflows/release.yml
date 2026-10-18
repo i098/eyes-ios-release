@@ -1,0 +1,103 @@
+# Ad hoc release of the Eyes iOS app (ayaangazali/eyes, apps/mobile) without the operator's Mac:
+# `pnpm adhoc:release` registers new worker iPhones with Apple, builds, uploads Eyes.ipa and texts the workers.
+# Runs when the Eyes API sees a new iPhone (repository_dispatch), hourly as a backstop, or by hand.
+name: Ad hoc release
+
+on:
+  repository_dispatch:
+    types: [device-registered]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and check only (nothing registered, uploaded or texted)
+        type: boolean
+        default: true
+      ref:
+        description: ayaangazali/eyes branch or commit
+        default: jerry/live-setup
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Cheap Linux check so the hourly run only starts a macOS build when an iPhone waits.
+  pending:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      count: ${{ steps.count.outputs.count }}
+    steps:
+      - id: count
+        env:
+          RELEASE_ENV: ${{ secrets.RELEASE_ENV }}
+        run: |
+          umask 077
+          printf '%s\n' "$RELEASE_ENV" > .env
+          node -e '
+            process.loadEnvFile(".env");
+            const base = process.env.INSFORGE_BASE_URL.replace(/\/+$/, "");
+            fetch(`${base}/api/database/records/worker_devices?select=udid&released_at=is.null`, {
+              headers: { Authorization: `Bearer ${process.env.INSFORGE_API_KEY}` },
+            }).then(async (r) => {
+              if (!r.ok) throw new Error(`InsForge HTTP ${r.status}`);
+              const n = (await r.json()).length;
+              console.log(`iPhones waiting for a release: ${n}`);
+              require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `count=${n}\n`);
+            });
+          '
+          rm .env
+
+  release:
+    needs: pending
+    if: github.event_name != 'schedule' || needs.pending.outputs.count != '0'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ayaangazali/eyes
+          ref: ${{ github.event.client_payload.ref || inputs.ref || 'jerry/live-setup' }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Signing keychain, App Store Connect key, .env
+        env:
+          RELEASE_ENV: ${{ secrets.RELEASE_ENV }}
+          ASC_P8: ${{ secrets.ASC_P8 }}
+          DIST_P12: ${{ secrets.DIST_P12 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          umask 077
+          printf '%s\n' "$RELEASE_ENV" > .env
+          key_id=$(sed -n 's/^ASC_KEY_ID=//p' .env | tr -d "\"'")
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf '%s\n' "$ASC_P8" > ~/.appstoreconnect/private_keys/AuthKey_$key_id.p8
+          kc="$RUNNER_TEMP/eyes.keychain-db"
+          kc_pass=$(openssl rand -hex 24)
+          security create-keychain -p "$kc_pass" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kc_pass" "$kc"
+          printf '%s' "$DIST_P12" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$kc"
+          rm "$RUNNER_TEMP/dist.p12"
+          curl -fsSL -o "$RUNNER_TEMP/wwdr.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          security import "$RUNNER_TEMP/wwdr.cer" -k "$kc" || true
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$kc" | sed -E 's/[0-9A-F]{40}/<sha>/'
+
+      - name: pnpm adhoc:release
+        run: pnpm adhoc:release ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '--dry-run' || '' }}
+
+      - name: Clean up
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/eyes.keychain-db" || true
+          rm -rf .env ~/.appstoreconnect
