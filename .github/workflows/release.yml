@@ -7,7 +7,7 @@ on:
   repository_dispatch:
     types: [device-registered]
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "1-59/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
