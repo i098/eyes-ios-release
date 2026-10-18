@@ -91,7 +91,7 @@ jobs:
           security import "$RUNNER_TEMP/wwdr.cer" -k "$kc" || true
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$kc" > /dev/null
           security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
-          security find-identity -v -p codesigning "$kc" | tail -1
+          security find-identity -v -p codesigning "$kc" | sed -nE 's/^ *[0-9]+\) ([0-9A-F]{6})[0-9A-F]{34} .*/signing certificate sha1 \1…/p'
 
       - name: pnpm adhoc:release
         # Dry run by hand (input), from a dispatch payload, or for every run while the repo variable DRY_RUN is "true" (end-to-end tests).
