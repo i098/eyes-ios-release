@@ -91,10 +91,11 @@ jobs:
           security import "$RUNNER_TEMP/wwdr.cer" -k "$kc" || true
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$kc" > /dev/null
           security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
-          security find-identity -v -p codesigning "$kc" | sed -E 's/[0-9A-F]{40}/<sha>/'
+          security find-identity -v -p codesigning "$kc" | tail -1
 
       - name: pnpm adhoc:release
-        run: pnpm adhoc:release ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '--dry-run' || '' }}
+        # Dry run by hand (input) or from a dispatch whose payload sets dry_run (tests of the dispatch path).
+        run: pnpm adhoc:release ${{ (inputs.dry_run || github.event.client_payload.dry_run) && '--dry-run' || '' }}
 
       - name: Clean up
         if: always()
